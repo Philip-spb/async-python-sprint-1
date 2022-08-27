@@ -1,5 +1,11 @@
-from requests import request
 import logging
+import sys
+import json
+
+if sys.version_info[0] == 3:
+    from urllib.request import urlopen
+else:
+    from urllib import urlopen
 
 logger = logging.getLogger()
 
@@ -33,14 +39,15 @@ class YandexWeatherAPI:
         """ Base request method """
 
         try:
-            resp = request(url=url, method=method)
-            if resp.status_code != 200:
+            with urlopen(url) as req:
+                resp = req.read().decode("utf-8")
+                resp = json.loads(resp)
+            if req.status != 200:
                 raise Exception(
                     "Error during execute request. {}: {}".format(
-                        resp.status_code, resp.reason
+                        resp.status, resp.reason
                     )
                 )
-
             return resp
         except Exception as ex:
             logger.error(ex)
@@ -59,5 +66,4 @@ class YandexWeatherAPI:
         :return: response data as json
         """
         city_url = self._get_url_by_city_name(city_name)
-        resp = self._do_req(city_url)
-        return resp.json()
+        return self._do_req(city_url)
