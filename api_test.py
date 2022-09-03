@@ -1,3 +1,9 @@
+def check_python_version():
+    from utils import check_python_version
+
+    check_python_version()
+
+
 def check_api():
     from api_client import YandexWeatherAPI
 
@@ -10,4 +16,5 @@ def check_api():
 
 
 if __name__ == "__main__":
+    check_python_version()
     check_api()

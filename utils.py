@@ -16,3 +16,20 @@ CITIES = {
     "CAIRO": "https://code.s3.yandex.net/async-module/cairo-response.json",
 }
 ERR_MESSAGE_TEMPLATE = "Something wrong. Please contact with mentor."
+
+MIN_MAJOR_PYTHON_VER = 3
+MIN_MINOR_PYTHON_VER = 9
+
+
+def check_python_version():
+    import sys
+
+    if (
+        sys.version_info.major < MIN_MAJOR_PYTHON_VER
+        or sys.version_info.minor < MIN_MINOR_PYTHON_VER
+    ):
+        raise Exception(
+            "Please use python version >= {}.{}".format(
+                MIN_MAJOR_PYTHON_VER, MIN_MINOR_PYTHON_VER
+            )
+        )
