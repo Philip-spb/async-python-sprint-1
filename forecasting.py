@@ -3,13 +3,14 @@
 # import subprocess
 # import multiprocessing
 
-from utils import YandexWeatherAPI, CITIES
+from api_client import YandexWeatherAPI
 from tasks import (
     DataFetchingTask,
     DataCalculationTask,
     DataAggregationTask,
     DataAnalyzingTask,
 )
+from utils import CITIES
 
 
 def forecast_weather():
