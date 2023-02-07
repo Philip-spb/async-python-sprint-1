@@ -1,31 +1,25 @@
-from multiprocessing import Queue
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
-from tasks import (DataFetchingTask, DataAggregationTask, DataAnalyzingTask)
 from utils import CITIES
+from tasks import (DataFetchingTask, DataAggregationTask, DataCalculationTask, CITY_DATA,
+                   DataAnalyzingTask)
 
 
 def forecast_weather():
     """
     Анализ погодных условий по городам
     """
-    queue = Queue()
-    processes = []
-    data_aggregation = DataAggregationTask(queue)
+    with ThreadPoolExecutor() as pool:
+        pool.map(DataFetchingTask().run, CITIES)
 
-    for city in CITIES.keys():
-        process = DataFetchingTask(city, queue)
-        process.start()
-        processes.append(process)
+    with ProcessPoolExecutor() as pool:
+        data = pool.map(DataCalculationTask().run, CITY_DATA)
 
-    for process in processes:
-        process.join()
+    # Раскрываем все вложенные кортежи
+    data = [item for sublist in data for item in sublist]
 
-    data_aggregation.start()
-    data_aggregation.join()
-
-    data_analyzing = DataAnalyzingTask()
-    data_analyzing.start()
-    data_analyzing.join()
+    DataAggregationTask(list(data)).run()
+    DataAnalyzingTask().perform()
 
 
 if __name__ == "__main__":

@@ -1,17 +1,18 @@
 import csv
+import logging
 from copy import copy
 from datetime import date, datetime
-import logging
 from dataclasses import dataclass
+from itertools import takewhile
 from typing import Tuple, List, Union
 
-from multiprocessing import Process, Queue, Condition
+from multiprocessing import Process
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 
 from api_client import YandexWeatherAPI
 from utils import (CITIES, TIME_INTERVAL, GOOD_WEATHER, TEMPERATURE_TASK_NAME,
-                   HOURS_WITHOUT_PRECIPITATION_TASK_NAME,
-                   FILE_NAME)
+                   HOURS_WITHOUT_PRECIPITATION_TASK_NAME, FILE_NAME)
 
 logging.basicConfig(
     filename='application-log.log',
@@ -20,7 +21,8 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger()
-condition = Condition()
+CITY_DATA = []
+lock = Lock()
 
 
 @dataclass
@@ -31,30 +33,20 @@ class WeatherData:
     value: Union[int, float]
 
 
-class DataFetchingTask(Process):
+class DataFetchingTask:
     """
     Получение данных через API
     """
 
     data = None
 
-    def __init__(self, city: str, queue: Queue):
-        super().__init__()
-        try:
-            assert city in CITIES.keys(), f'city ({city}) not from the list of cities'
-        except Exception as e:
-            logger.error(e)
-            raise Exception(e)
-
-        self.city = city
-        self.queue = queue
+    def __init__(self):
         self.yw_api = YandexWeatherAPI()
         self.data = None
 
-    def _receive_weather_forecast_data(self) -> list:
+    def _receive_weather_forecast_data(self, city: str) -> list:
         if not self.data:
-            self.data = self.yw_api.get_forecasting(self.city)
-
+            self.data = self.yw_api.get_forecasting(city)
         try:
             forecast_data = self.data['forecasts']
         except Exception as e:
@@ -63,16 +55,9 @@ class DataFetchingTask(Process):
 
         return forecast_data
 
-    def run(self) -> None:
-        data = self._receive_weather_forecast_data()
-        data_calculation = DataCalculationTask(data, self.queue, self.city)
-
-        # Запускаем два потока на отправку данных о температуре и
-        # количеству часов без осадков в дне
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            pool.submit(data_calculation.day_average_temperature.calculate)
-            pool.submit(
-                data_calculation.day_hours_without_precipitation.calculate)
+    def run(self, city: str) -> None:
+        data = self._receive_weather_forecast_data(city)
+        CITY_DATA.append((city, data))
 
 
 class DataHelperMixin:
@@ -83,7 +68,7 @@ class DataHelperMixin:
         try:
             hours = data['hours']
             current_date = data['date']
-        except Exception as e:
+        except KeyError as e:
             logger.error(e)
             raise Exception(e)
 
@@ -96,9 +81,8 @@ class CalculateDayAverageTemperature(DataHelperMixin):
     Класс с методами для вычисления средней температуры
     """
 
-    def __init__(self, raw_data: list, queue: Queue, city: str):
+    def __init__(self, raw_data: list, city: str):
         self.raw_data = raw_data
-        self.queue = queue
         self.city = city
 
     def _get_temperature_day_value(self, data: dict):
@@ -121,7 +105,6 @@ class CalculateDayAverageTemperature(DataHelperMixin):
 
         weather_data = WeatherData(self.city, TEMPERATURE_TASK_NAME,
                                    current_date, average_temperature)
-        self.queue.put(weather_data)
 
         return weather_data
 
@@ -129,8 +112,10 @@ class CalculateDayAverageTemperature(DataHelperMixin):
         """
         Отправка в очередь данных по средним дневным температурам
         """
-        for day in self.raw_data:
-            self._get_temperature_day_value(day)
+        return [self._get_temperature_day_value(day)
+                for day
+                in self.raw_data
+                if self._get_temperature_day_value(day)]
 
 
 class CalculateDayHoursWithoutPrecipitation(DataHelperMixin):
@@ -138,9 +123,8 @@ class CalculateDayHoursWithoutPrecipitation(DataHelperMixin):
     Класс с методами для вычисления количества часов без осадков
     """
 
-    def __init__(self, raw_data: list, queue: Queue, city: str):
+    def __init__(self, raw_data: list, city: str):
         self.raw_data = raw_data
-        self.queue = queue
         self.city = city
 
     def _count_hours_without_perceptions(self, data: dict):
@@ -162,13 +146,13 @@ class CalculateDayHoursWithoutPrecipitation(DataHelperMixin):
                                    current_date,
                                    hours_without_precipitation)
 
-        self.queue.put(weather_data)
         return weather_data
 
     def calculate(self):
-
-        for day in self.raw_data:
-            self._count_hours_without_perceptions(day)
+        return [self._count_hours_without_perceptions(day)
+                for day
+                in self.raw_data
+                if self._count_hours_without_perceptions(day)]
 
 
 class DataCalculationTask:
@@ -176,32 +160,36 @@ class DataCalculationTask:
     Вычисление погодных параметров
     """
 
-    def __init__(self, raw_data: list, queue: Queue, city: str):
-        self.day_average_temperature = CalculateDayAverageTemperature(raw_data, queue, city)
-        self.day_hours_without_precipitation = CalculateDayHoursWithoutPrecipitation(raw_data,
-                                                                                     queue, city)
+    @staticmethod
+    def run(data: tuple):
+        city, city_data = data
+        day_temperature = CalculateDayAverageTemperature(city_data, city).calculate()
+        hours_without_precipitation = (
+            CalculateDayHoursWithoutPrecipitation(city_data, city).calculate()
+        )
+        return *day_temperature, *hours_without_precipitation
 
 
-class DataAggregationTask(Process):
+class DataAggregationTask:
     """
     Объединение вычисленных данных
 
     Процесс по записи полученных вычисленных данных в файл
     """
 
-    def __init__(self, queue: Queue):
+    def __init__(self, data: list):
         super().__init__()
-        self.data = []
-        self.queue = queue
+        self.data = data
+        self.header = None
+        self.row = None
 
     def _get_all_dates(self) -> list:
         only_dates = {data.date for data in self.data}
         return sorted(only_dates)
 
-    @staticmethod
-    def _create_header_for_csv(dates: list) -> list:
-        headers = ['Город/день', '', *dates, 'Среднее', 'Рейтинг']
-        return headers
+    def _create_header_for_csv(self, dates: list) -> None:
+        self.header = ['Город/день', '', *dates, 'Среднее']
+        self.row = ['', ] * len(self.header)
 
     @staticmethod
     def _calculate_average_data(data: List[tuple]) -> float:
@@ -227,7 +215,7 @@ class DataAggregationTask(Process):
             hours_without_precipitation = [(str(data.date), data.value)
                                            for data in city_hours_without_precipitation]
             item = {
-                "city": city,
+                'city': city,
                 'temperature': {
                     'date': temperature_list,
                     'average': self._calculate_average_data(temperature_list)
@@ -242,50 +230,50 @@ class DataAggregationTask(Process):
 
         return data_list
 
-    def run(self):
-        while not self.queue.empty():
-            self.data.append(self.queue.get())
+    def _write_row_to_file(self, city_data: list, ) -> None:
+        lock.acquire()
 
+        with open(FILE_NAME, 'a') as csv_file:
+            writer = csv.writer(csv_file, delimiter=',')
+            current_row_1 = copy(self.row)
+            current_row_2 = copy(self.row)
+            current_row_1[0] = city_data['city']
+            current_row_1[1] = 'Температура, среднее'
+
+            current_col = 2
+            for _, value in city_data['temperature']['date']:
+                current_row_1[current_col] = str(value)[0:5]
+                current_col += 1
+
+            current_row_1[-1] = str(city_data['temperature']['average'])[0:5]
+            writer.writerow(current_row_1)
+
+            current_row_2[1] = 'Без осадков, часов'
+
+            current_col = 2
+            for _, value in city_data['days_without_precipitation']['date']:
+                current_row_2[current_col] = str(value)[0:5]
+                current_col += 1
+
+            current_row_2[-1] = str(
+                city_data['days_without_precipitation']['average'])[0:5]
+            writer.writerow(current_row_2)
+
+        lock.release()
+
+    def run(self):
         all_dates = self._get_all_dates()
 
         data = self._create_data_list()
-        data = sorted(data,
-                      key=lambda x: (x['temperature']['average'],
-                                     x['days_without_precipitation']['average']),
-                      reverse=True)
 
-        header = self._create_header_for_csv(all_dates)
-        row = ['', ] * len(header)
+        self._create_header_for_csv(all_dates)
 
         with open(FILE_NAME, 'w') as csv_file:
             writer = csv.writer(csv_file, delimiter=',')
-            writer.writerow(header)
+            writer.writerow(self.header)
 
-            for num, city_data in enumerate(data):
-                current_row_1 = copy(row)
-                current_row_2 = copy(row)
-                current_row_1[0] = city_data['city']
-                current_row_1[1] = 'Температура, среднее'
-
-                current_col = 2
-                for _, value in city_data['temperature']['date']:
-                    current_row_1[current_col] = str(value)[0:5]
-                    current_col += 1
-
-                current_row_1[-2] = str(city_data['temperature']['average'])[0:5]
-                current_row_1[-1] = num + 1
-                writer.writerow(current_row_1)
-
-                current_row_2[1] = 'Без осадков, часов'
-
-                current_col = 2
-                for _, value in city_data['days_without_precipitation']['date']:
-                    current_row_2[current_col] = str(value)[0:5]
-                    current_col += 1
-
-                current_row_2[-2] = str(
-                    city_data['days_without_precipitation']['average'])[0:5]
-                writer.writerow(current_row_2)
+        with ThreadPoolExecutor() as pool:
+            pool.map(self._write_row_to_file, data)
 
 
 class DataAnalyzingTask(Process):
@@ -302,25 +290,28 @@ class DataAnalyzingTask(Process):
     def _get_data_from_file(filename: str) -> List[list]:
         with open(filename, 'r') as csv_file:
             reader = csv.reader(csv_file, delimiter=",", quotechar='"')
-            data_read = [row for row in reader][1:]
+            data_read = [[row[0], row[-1]] for row in reader][1:]
         return data_read
 
     @staticmethod
-    def _get_list_of_top_cities(data: List[list]) -> List[tuple]:
-        city_data = []
-        while len(data) > 2:
-            city_name = data[0][0]
-            city_average_temperature = data[0][-2]
-            city_average_good_days = data[1][-2]
-            if (not city_data
-                    or (city_data[0][1] == city_average_temperature
-                        and city_data[0][2] == city_average_good_days)):
-                city_data.append((city_name, city_average_temperature,
-                                  city_average_good_days))
-                data = data[2:]
-            else:
-                break
-        return city_data
+    def _prepare_data_for_sorting(city_data: List[list]) -> List[tuple]:
+        data_for_sorting = []
+        while len(city_data) >= 2:
+            data_for_sorting.append((city_data[0][0], city_data[0][1], city_data[1][1]))
+            city_data = city_data[2:]
+
+        return data_for_sorting
+
+    @staticmethod
+    def _get_list_of_top_cities(data_for_sorting: List[tuple]) -> List[tuple]:
+        sorted_data = sorted(data_for_sorting, key=lambda x: (x[1], x[2]), reverse=True)
+        top_weather = sorted_data[0][1]
+        top_days = sorted_data[0][2]
+        top_cities = list(takewhile(lambda x:
+                                    x[1] == top_weather and x[2] == top_days,
+                                    sorted_data)
+                          )
+        return top_cities
 
     @staticmethod
     def _get_congratulation_str(city_data: List[tuple]) -> str:
@@ -335,10 +326,12 @@ class DataAnalyzingTask(Process):
             congratulation_str = f'Winners is cities: {city_names}'
         return congratulation_str
 
-    def run(self):
+    def perform(self):
         data_read = self._get_data_from_file(FILE_NAME)
-        city_data = self._get_list_of_top_cities(data_read)
-        congratulation_str = self._get_congratulation_str(city_data)
+        data_for_sorting = self._prepare_data_for_sorting(data_read)
+        top_cities = self._get_list_of_top_cities(data_for_sorting)
+        congratulation_str = self._get_congratulation_str(top_cities)
+
         print('-' * 30)
         print(congratulation_str)
         print('-' * 30)
