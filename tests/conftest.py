@@ -1,12 +1,6 @@
 import json
 
 import pytest
-from multiprocessing import Queue
-
-
-@pytest.fixture
-def que_fixture():
-    return Queue()
 
 
 @pytest.fixture
